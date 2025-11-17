@@ -1,21 +1,16 @@
 {
   "name": "zknon-backend",
-  "version": "1.0.0",
-  "description": "ZKnon minimal backend for pool relay & RPC proxy",
+  "version": "1.1.0",
+  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.3",
     "bs58": "^5.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "morgan": "^1.10.0"
+    "express": "^4.19.2"
   }
 }
-
