@@ -1,179 +1,176 @@
-import express from "express";
-import helmet from "helmet";
-import cors from "cors";
-import rateLimit from "express-rate-limit";
-import morgan from "morgan";
+const express = require("express");
+const cors = require("cors");
+const bs58 = require("bs58");
+const dotenv = require("dotenv");
+dotenv.config();
 
-// ===== ENV =====
-const PORT = process.env.PORT || 10000;
-const RPC_URL = process.env.RPC_URL || "https://solana-mainnet.gateway.tatum.io/";
+const {
+  Connection,
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+  LAMPORTS_PER_SOL,
+} = require("@solana/web3.js");
+
+// ------- Env & Setup -------
+const PORT = process.env.PORT || 8080;
+const RPC_URL = process.env.RPC_URL || "https://solana-mainnet.gateway.tatum.io";
 const TATUM_API_KEY = process.env.TATUM_API_KEY || "";
-const POOL_ADDRESS = process.env.POOL_ADDRESS || "";
+
+const POOL_PUBLIC = process.env.POOL_PUBLIC;
+const POOL_SECRET_B58 = process.env.POOL_SECRET_B58 || "";
+const POOL_SECRET_JSON = process.env.POOL_SECRET_JSON || "";
+
+if (!POOL_PUBLIC) {
+  console.error("Missing POOL_PUBLIC in env.");
+  process.exit(1);
+}
+const POOL_PUBKEY = new PublicKey(POOL_PUBLIC);
+
+// Allowlist CORS
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    const ok = ALLOWED.some(a => origin === a || origin.startsWith(a));
+    return cb(ok ? null : new Error("Not allowed by CORS"), ok);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+  credentials: false,
+};
 
-const TX_RATELIMIT = Number(process.env.TX_RATELIMIT || "8");
-
-// ===== APP =====
-const app = express();
-
-// basic hardening
-app.use(helmet({
-  crossOriginResourcePolicy: false
-}));
-
-// CORS: whitelist hanya domain kamu
-app.use(
-  cors({
-    origin(origin, cb) {
-      // allow curl / server-to-server (tanpa origin)
-      if (!origin) return cb(null, true);
-      if (ALLOWED.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS: origin not allowed"), false);
-    },
-    credentials: false,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["content-type"]
-  })
-);
-app.options("*", cors());
-
-// logging
-app.use(morgan("tiny"));
-app.use(express.json({ limit: "1mb" }));
-
-// ===== helpers =====
-async function rpc(method, params = []) {
-  const body = {
-    jsonrpc: "2.0",
-    id: Date.now(),
-    method,
-    params
-  };
-
-  const headers = {
-    accept: "application/json",
-    "content-type": "application/json"
-  };
-  // Tatum butuh x-api-key
-  if (TATUM_API_KEY) headers["x-api-key"] = TATUM_API_KEY;
-
-  const res = await fetch(RPC_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body)
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`RPC HTTP ${res.status}: ${text || res.statusText}`);
-  }
-
-  const json = await res.json();
-  if (json.error) {
-    throw new Error(`RPC ${method} error: ${JSON.stringify(json.error)}`);
-  }
-  return json.result;
-}
-
-function maskAddr(addr = "") {
-  if (addr.length < 10) return addr;
-  return addr.slice(0, 4) + "..." + addr.slice(-4);
-}
-
-// ===== rate limit khusus kirim tx =====
-const txLimiter = rateLimit({
-  windowMs: 15 * 1000, // 15 detik
-  max: TX_RATELIMIT,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { ok: false, error: "Too many requests, slow down." }
+// Tatum connection with API key header
+const connection = new Connection(RPC_URL, {
+  commitment: "confirmed",
+  httpHeaders: TATUM_API_KEY ? { "x-api-key": TATUM_API_KEY } : undefined,
 });
 
-// ===== routes =====
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "ZKnon backend",
-    time: new Date().toISOString(),
-    env: {
-      rpc: RPC_URL,
-      pool: maskAddr(POOL_ADDRESS),
-      cors: ALLOWED
-    },
-    hasKey: Boolean(TATUM_API_KEY)
-  });
-});
-
-app.get("/api/config", (req, res) => {
-  res.json({
-    poolAddress: POOL_ADDRESS,
-    rpc: RPC_URL,
-    cors: ALLOWED
-  });
-});
-
-// saldo pool vault
-app.get("/api/pool/balance", async (req, res) => {
+// Load pool Keypair (supports base58 or JSON array)
+function loadPoolKeypair() {
   try {
-    if (!POOL_ADDRESS) throw new Error("POOL_ADDRESS not configured");
-    const lamports = await rpc("getBalance", [POOL_ADDRESS, { commitment: "processed" }]);
-    const value = typeof lamports === "number" ? lamports : lamports?.value ?? 0;
-    res.json({
+    if (POOL_SECRET_JSON) {
+      const arr = JSON.parse(POOL_SECRET_JSON);
+      const sk = Uint8Array.from(arr);
+      return Keypair.fromSecretKey(sk);
+    }
+    if (POOL_SECRET_B58) {
+      const sk = bs58.decode(POOL_SECRET_B58);
+      return Keypair.fromSecretKey(sk);
+    }
+    throw new Error("No pool secret provided");
+  } catch (e) {
+    console.error("Failed to load pool secret:", e.message);
+    process.exit(1);
+  }
+}
+const POOL_KEYPAIR = loadPoolKeypair();
+if (!POOL_KEYPAIR.publicKey.equals(POOL_PUBKEY)) {
+  console.warn(
+    `Warning: POOL_PUBLIC (${POOL_PUBKEY.toBase58()}) != keypair public (${POOL_KEYPAIR.publicKey.toBase58()})`
+  );
+}
+
+// Confirm by signature polling (stable across nodes)
+async function confirmBySignature(signature, timeoutMs = 60000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const st = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+    const v = st && st.value && st.value[0];
+    if (v && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) {
+      return v;
+    }
+    await new Promise(r => setTimeout(r, 1200));
+  }
+  throw new Error("Confirmation timeout");
+}
+
+// ------- App -------
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+app.get("/health", async (req, res) => {
+  try {
+    const bh = await connection.getBlockHeight("confirmed");
+    res.json({ ok: true, rpc: "ok", blockHeight: bh, pool: POOL_PUBKEY.toBase58() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+// Core handler
+async function handleWithdraw(req, res) {
+  try {
+    const { to, amount, depositSignature } = req.body || {};
+    if (!to || !amount) return res.status(400).json({ ok: false, error: "Missing 'to' or 'amount'." });
+
+    let recipient;
+    try {
+      recipient = new PublicKey(to);
+    } catch {
+      return res.status(400).json({ ok: false, error: "Invalid recipient address." });
+    }
+
+    const lamports = Math.round(Number(amount) * LAMPORTS_PER_SOL);
+    if (!Number.isFinite(lamports) || lamports <= 0) {
+      return res.status(400).json({ ok: false, error: "Invalid amount." });
+    }
+
+    // (Optional) You can validate depositSignature existence here if you want strict flow
+    if (depositSignature && typeof depositSignature === "string") {
+      // Just log, or fetch status if you want:
+      // const st = await connection.getSignatureStatuses([depositSignature], { searchTransactionHistory: true });
+      // console.log("Deposit status:", st.value?.[0]);
+    }
+
+    // Get recent blockhash
+    const { blockhash } = await connection.getLatestBlockhash("finalized");
+
+    // Build transfer from pool → recipient
+    const ix = SystemProgram.transfer({
+      fromPubkey: POOL_KEYPAIR.publicKey,
+      toPubkey: recipient,
+      lamports,
+    });
+
+    const tx = new Transaction({
+      feePayer: POOL_KEYPAIR.publicKey,
+      recentBlockhash: blockhash,
+    }).add(ix);
+
+    // Sign & send
+    tx.sign(POOL_KEYPAIR);
+    const raw = tx.serialize();
+    const sig = await connection.sendRawTransaction(raw, { skipPreflight: false });
+
+    // Confirm robustly
+    const status = await confirmBySignature(sig);
+    return res.json({
       ok: true,
-      lamports: value,
-      sol: value / 1_000_000_000
+      withdrawSignature: sig,
+      slot: status?.slot,
+      to: recipient.toBase58(),
+      amountLamports: lamports,
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    console.error("Withdraw error:", e);
+    return res.status(500).send(typeof e === "string" ? e : e.message || "Server error");
   }
-});
+}
 
-// blockhash & blockheight opsional buat client
-app.get("/api/rpc/latest-blockhash", async (req, res) => {
-  try {
-    const r = await rpc("getLatestBlockhash", [{ commitment: "finalized" }]);
-    res.json({ ok: true, result: r });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-app.get("/api/rpc/blockheight", async (req, res) => {
-  try {
-    const r = await rpc("getBlockHeight");
-    res.json({ ok: true, result: r });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
+// Routes (both paths supported)
+app.post("/withdraw", handleWithdraw);
+app.post("/relay/withdraw", handleWithdraw);
 
-// kirim transaksi base64 (sudah di-sign oleh wallet di frontend)
-app.post("/api/send-tx", txLimiter, async (req, res) => {
-  try {
-    const { tx } = req.body || {};
-    if (!tx || typeof tx !== "string") {
-      return res.status(400).json({ ok: false, error: "Body {tx} (base64) is required" });
-    }
-    // validasi tipis base64
-    if (!/^[A-Za-z0-9+/=]+$/.test(tx)) {
-      return res.status(400).json({ ok: false, error: "Invalid base64" });
-    }
-    // forward ke RPC
-    const sig = await rpc("sendTransaction", [tx, { encoding: "base64", skipPreflight: false }]);
-    return res.json({ ok: true, signature: sig });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// not found
+// Fallback
 app.use((req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 
-// graceful
-const server = app.listen(PORT, () => {
-  console.log(`ZKnon backend listening on :${PORT}`);
+app.listen(PORT, () => {
+  console.log(`ZKNON backend listening on :${PORT}`);
 });
-process.on("SIGTERM", () => server.close(() => process.exit(0)));
-process.on("SIGINT", () => server.close(() => process.exit(0)));
