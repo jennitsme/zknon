@@ -8,7 +8,6 @@ import {
   Keypair,
   PublicKey,
   SystemProgram,
-  Transaction,
   VersionedTransaction,
   TransactionMessage
 } from '@solana/web3.js';
@@ -17,49 +16,82 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
-/* ---------- CORS ---------- */
+/* ---------------- CORS ---------------- */
 const ALLOWED = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
     if (ALLOWED.includes(origin)) return cb(null, true);
-    return cb(new Error('CORS blocked'), false);
+    cb(new Error('CORS blocked'), false);
   },
   credentials: true
 }));
 
-/* ---------- ENV & KEYS ---------- */
+/* ---------------- Env & RPC ---------------- */
 const RPC_URL = process.env.RPC_URL;
 const TATUM_API_KEY = process.env.TATUM_API_KEY;
 const TX_RATELIMIT = Number(process.env.TX_RATELIMIT || 8);
-
 if (!RPC_URL || !TATUM_API_KEY) {
   console.error('Missing RPC_URL or TATUM_API_KEY');
   process.exit(1);
 }
 
+function loadPoolKeypair() {
+  // 1) Coba base58 (hapus semua whitespace)
+  const rawB58 = (process.env.POOL_SECRET_B58 || '').replace(/\s+/g, '').trim();
+
+  if (rawB58) {
+    try {
+      const raw = bs58.decode(rawB58);
+      if (raw.length === 64) {
+        console.log('POOL key format: base58(64 bytes)');
+        return Keypair.fromSecretKey(new Uint8Array(raw));
+      }
+      if (raw.length === 32) {
+        console.log('POOL key format: base58(32-bytes seed)');
+        return Keypair.fromSeed(new Uint8Array(raw));
+      }
+      throw new Error(`decoded length = ${raw.length} (expected 32 or 64)`);
+    } catch (e) {
+      console.error('Failed decode POOL_SECRET_B58:', e.message);
+    }
+  }
+
+  // 2) Coba JSON array (solana-keygen)
+  const rawJson = (process.env.POOL_SECRET_JSON || '').trim();
+  if (rawJson) {
+    try {
+      const arr = JSON.parse(rawJson);
+      if (!Array.isArray(arr)) throw new Error('not array');
+      const u8 = new Uint8Array(arr);
+      if (u8.length !== 64) throw new Error(`length ${u8.length}, expected 64`);
+      console.log('POOL key format: JSON array (64 bytes)');
+      return Keypair.fromSecretKey(u8);
+    } catch (e) {
+      console.error('Failed parse POOL_SECRET_JSON:', e.message);
+    }
+  }
+
+  throw new Error(
+    'Invalid pool key. Set POOL_SECRET_B58 (base58 32/64 bytes) ' +
+    'atau POOL_SECRET_JSON (JSON array 64 bytes).'
+  );
+}
+
 let POOL_KEYPAIR;
 try {
-  const sk = bs58.decode(process.env.POOL_SECRET_B58 || '');
-  if (!sk || (sk.length !== 64 && sk.length !== 32)) {
-    throw new Error('POOL_SECRET_B58 must be base58 of 64 or 32 bytes');
-  }
-  // Jika 32-byte seed, Solana akan derive pair; jika 64-byte secretKey langsung
-  POOL_KEYPAIR = (sk.length === 64)
-    ? Keypair.fromSecretKey(new Uint8Array(sk))
-    : Keypair.fromSeed(new Uint8Array(sk));
+  POOL_KEYPAIR = loadPoolKeypair();
 } catch (e) {
-  console.error('Invalid POOL_SECRET_B58:', e.message);
+  console.error(e.message);
   process.exit(1);
 }
 
-const POOL_PUBKEY = new PublicKey(process.env.POOL_ADDRESS || POOL_KEYPAIR.publicKey.toBase58());
+const POOL_PUBKEY =
+  new PublicKey(process.env.POOL_ADDRESS || POOL_KEYPAIR.publicKey.toBase58());
 
-/* ---------- RPC helper (Tatum) ---------- */
+/* ---------------- Tatum RPC helper ---------------- */
 async function tatumRpc(body) {
   const r = await fetch(RPC_URL, {
     method: 'POST',
@@ -70,6 +102,7 @@ async function tatumRpc(body) {
     },
     body: JSON.stringify(body)
   });
+
   const text = await r.text();
   let json;
   try { json = JSON.parse(text); } catch {
@@ -78,7 +111,7 @@ async function tatumRpc(body) {
   if (!r.ok || json.error) {
     const msg = json?.error?.message || r.statusText;
     const code = json?.error?.code || r.status;
-    const err = new Error(`${msg}`);
+    const err = new Error(msg);
     err.code = code;
     err.raw = json;
     throw err;
@@ -86,29 +119,25 @@ async function tatumRpc(body) {
   return json.result;
 }
 
-/* ---------- Rate limiter super sederhana ---------- */
-let calls = 0, windowStart = Date.now();
+/* ---------------- Simple rate limiter ---------------- */
+let calls = 0, t0 = Date.now();
 function guard() {
   const now = Date.now();
-  if (now - windowStart > 1000) { windowStart = now; calls = 0; }
+  if (now - t0 > 1000) { t0 = now; calls = 0; }
   if (++calls > TX_RATELIMIT) throw new Error('Rate limit');
 }
 
-/* ---------- Utils ---------- */
+/* ---------------- Utils ---------------- */
 const lamports = (sol) => Math.round(Number(sol) * 1e9);
 const ok = (res, data) => res.json({ ok: true, ...data });
-const fail = (res, code = 400, error = 'error') => res.status(code).json({ ok: false, error });
+const fail = (res, code, error) => res.status(code).json({ ok: false, error });
 
-/* ---------- Health ---------- */
+/* ---------------- Health ---------------- */
 app.get('/health', (_req, res) => {
-  ok(res, {
-    service: 'zknon-backend',
-    pool: POOL_PUBKEY.toBase58(),
-    cors: ALLOWED,
-  });
+  ok(res, { service: 'zknon-backend', pool: POOL_PUBKEY.toBase58(), cors: ALLOWED });
 });
 
-/* ---------- RPC proxy (opsional) ---------- */
+/* ---------------- RPC proxy (opsional) ---------------- */
 app.post('/rpc-proxy', async (req, res) => {
   try {
     guard();
@@ -121,50 +150,41 @@ app.post('/rpc-proxy', async (req, res) => {
   }
 });
 
-/* ---------- Withdraw/Relay nyata ---------- */
-/**
- * Body:
- *   { recipient: string(Pubkey), amountLamports: number }
- * Kirim lamports dari POOL_KEYPAIR ke recipient.
- */
+/* ---------------- Withdraw/Relay nyata ---------------- */
 async function doWithdraw(recipientStr, amountLamports) {
   const recipient = new PublicKey(recipientStr);
 
-  // 1) Ambil blockhash terbaru
   const { value: { blockhash, lastValidBlockHeight } } =
     await tatumRpc({ jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [] });
 
-  // 2) Buat instruksi transfer
   const ix = SystemProgram.transfer({
     fromPubkey: POOL_PUBKEY,
     toPubkey: recipient,
     lamports: Number(amountLamports)
   });
 
-  // 3) Bangun v0 tx agar size kecil & modern
-  const messageV0 = new TransactionMessage({
+  const msg = new TransactionMessage({
     payerKey: POOL_PUBKEY,
     recentBlockhash: blockhash,
     instructions: [ix]
   }).compileToV0Message();
 
-  const tx = new VersionedTransaction(messageV0);
-  tx.sign([POOL_KEYPAIR]);
+  const vtx = new VersionedTransaction(msg);
+  vtx.sign([POOL_KEYPAIR]);
 
-  const raw = Buffer.from(tx.serialize()).toString('base64');
+  const rawB64 = Buffer.from(vtx.serialize()).toString('base64');
 
-  // 4) Kirim raw tx via Tatum
   const sig = await tatumRpc({
     jsonrpc: '2.0',
     id: 1,
     method: 'sendRawTransaction',
-    params: [raw, { skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3 }]
+    params: [rawB64, { skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3 }]
   });
 
   return { signature: sig, lastValidBlockHeight };
 }
 
-async function handleRelay(req, res) {
+async function relayHandler(req, res) {
   try {
     guard();
     const { recipient, amountLamports } = req.body || {};
@@ -172,14 +192,12 @@ async function handleRelay(req, res) {
     if (!amountLamports || amountLamports <= 0) return fail(res, 400, 'amountLamports must be > 0');
 
     const { signature, lastValidBlockHeight } = await doWithdraw(recipient, amountLamports);
-
     ok(res, {
       signature,
       explorer: `https://solscan.io/tx/${signature}`,
       lastValidBlockHeight
     });
   } catch (e) {
-    // Retry sekali kalau blockhash expired
     const msg = String(e?.message || e);
     if (/block height exceeded|Blockhash not found|expired/i.test(msg)) {
       try {
@@ -198,12 +216,11 @@ async function handleRelay(req, res) {
   }
 }
 
-/* Routes: kompatibel dengan UI */
-app.post('/relay', handleRelay);
-app.post('/relay-withdraw', handleRelay);
-app.post('/withdraw', handleRelay); // alias agar UI lama tidak 404
+app.post('/withdraw', relayHandler);
+app.post('/relay', relayHandler);
+app.post('/relay-withdraw', relayHandler);
 
-/* ---------- Start ---------- */
+/* ---------------- Start ---------------- */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`ZKnon backend listening on :${PORT}`);
