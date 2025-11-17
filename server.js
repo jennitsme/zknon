@@ -1,176 +1,138 @@
-const express = require("express");
-const cors = require("cors");
-const bs58 = require("bs58");
-const dotenv = require("dotenv");
-dotenv.config();
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+import fetch from 'node-fetch';
 
-const {
-  Connection,
-  Keypair,
-  PublicKey,
-  SystemProgram,
-  Transaction,
-  LAMPORTS_PER_SOL,
-} = require("@solana/web3.js");
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('tiny'));
 
-// ------- Env & Setup -------
-const PORT = process.env.PORT || 8080;
-const RPC_URL = process.env.RPC_URL || "https://solana-mainnet.gateway.tatum.io";
-const TATUM_API_KEY = process.env.TATUM_API_KEY || "";
-
-const POOL_PUBLIC = process.env.POOL_PUBLIC;
-const POOL_SECRET_B58 = process.env.POOL_SECRET_B58 || "";
-const POOL_SECRET_JSON = process.env.POOL_SECRET_JSON || "";
-
-if (!POOL_PUBLIC) {
-  console.error("Missing POOL_PUBLIC in env.");
-  process.exit(1);
-}
-const POOL_PUBKEY = new PublicKey(POOL_PUBLIC);
-
-// Allowlist CORS
-const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
+const ALLOWED = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
   .map(s => s.trim())
   .filter(Boolean);
-const corsOptions = {
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    const ok = ALLOWED.some(a => origin === a || origin.startsWith(a));
-    return cb(ok ? null : new Error("Not allowed by CORS"), ok);
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type"],
-  credentials: false,
-};
 
-// Tatum connection with API key header
-const connection = new Connection(RPC_URL, {
-  commitment: "confirmed",
-  httpHeaders: TATUM_API_KEY ? { "x-api-key": TATUM_API_KEY } : undefined,
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true); // curl / local
+      if (ALLOWED.includes(origin)) return cb(null, true);
+      cb(new Error('CORS blocked'));
+    },
+    credentials: true
+  })
+);
+
+// ---------- ENV ----------
+const POOL_ADDRESS =
+  process.env.POOL_ADDRESS || process.env.POOL_PUBLIC || '';
+
+const RPC_URL = process.env.RPC_URL;
+const TATUM_API_KEY = process.env.TATUM_API_KEY;
+const TX_RATELIMIT = Number(process.env.TX_RATELIMIT || 8);
+
+if (!POOL_ADDRESS) {
+  console.error('Missing POOL_ADDRESS (or POOL_PUBLIC) in env.');
+  process.exit(1);
+}
+if (!RPC_URL || !TATUM_API_KEY) {
+  console.error('Missing RPC_URL or TATUM_API_KEY in env.');
+  process.exit(1);
+}
+
+// ---------- helpers ----------
+async function tatumRpc(body) {
+  const res = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': TATUM_API_KEY,
+      accept: 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+  const txt = await res.text();
+  let json;
+  try {
+    json = JSON.parse(txt);
+  } catch (e) {
+    throw new Error(`RPC parse error: ${txt.slice(0, 200)}`);
+  }
+  if (!res.ok || json.error) {
+    const msg = json?.error?.message || res.statusText;
+    const code = json?.error?.code || res.status;
+    const err = new Error(msg);
+    err.code = code;
+    err.raw = json;
+    throw err;
+  }
+  return json;
+}
+
+// very tiny rate-limit per instance
+let calls = 0;
+let windowStart = Date.now();
+function guard() {
+  const now = Date.now();
+  if (now - windowStart > 1000) {
+    windowStart = now;
+    calls = 0;
+  }
+  if (calls++ > TX_RATELIMIT) throw new Error('Rate limit');
+}
+
+// ---------- routes ----------
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    pool: POOL_ADDRESS,
+    rpc: !!RPC_URL,
+    cors: ALLOWED
+  });
 });
 
-// Load pool Keypair (supports base58 or JSON array)
-function loadPoolKeypair() {
+app.post('/rpc-proxy', async (req, res) => {
   try {
-    if (POOL_SECRET_JSON) {
-      const arr = JSON.parse(POOL_SECRET_JSON);
-      const sk = Uint8Array.from(arr);
-      return Keypair.fromSecretKey(sk);
-    }
-    if (POOL_SECRET_B58) {
-      const sk = bs58.decode(POOL_SECRET_B58);
-      return Keypair.fromSecretKey(sk);
-    }
-    throw new Error("No pool secret provided");
+    guard();
+    const { method, params, id } = req.body || {};
+    if (!method) return res.status(400).json({ ok: false, error: 'method required' });
+    const out = await tatumRpc({
+      jsonrpc: '2.0',
+      id: id ?? 1,
+      method,
+      params: params ?? []
+    });
+    res.json({ ok: true, result: out.result });
   } catch (e) {
-    console.error("Failed to load pool secret:", e.message);
-    process.exit(1);
-  }
-}
-const POOL_KEYPAIR = loadPoolKeypair();
-if (!POOL_KEYPAIR.publicKey.equals(POOL_PUBKEY)) {
-  console.warn(
-    `Warning: POOL_PUBLIC (${POOL_PUBKEY.toBase58()}) != keypair public (${POOL_KEYPAIR.publicKey.toBase58()})`
-  );
-}
-
-// Confirm by signature polling (stable across nodes)
-async function confirmBySignature(signature, timeoutMs = 60000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const st = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
-    const v = st && st.value && st.value[0];
-    if (v && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) {
-      return v;
-    }
-    await new Promise(r => setTimeout(r, 1200));
-  }
-  throw new Error("Confirmation timeout");
-}
-
-// ------- App -------
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
-
-app.get("/health", async (req, res) => {
-  try {
-    const bh = await connection.getBlockHeight("confirmed");
-    res.json({ ok: true, rpc: "ok", blockHeight: bh, pool: POOL_PUBKEY.toBase58() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || String(e) });
+    res.status(502).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// Core handler
-async function handleWithdraw(req, res) {
-  try {
-    const { to, amount, depositSignature } = req.body || {};
-    if (!to || !amount) return res.status(400).json({ ok: false, error: "Missing 'to' or 'amount'." });
+// alias /relay  (dipanggil UI kamu)
+app.post('/relay', async (req, res) => handleRelay(req, res));
+// alias lama /relay-withdraw (biar kompatibel)
+app.post('/relay-withdraw', async (req, res) => handleRelay(req, res));
 
-    let recipient;
-    try {
-      recipient = new PublicKey(to);
-    } catch {
-      return res.status(400).json({ ok: false, error: "Invalid recipient address." });
-    }
-
-    const lamports = Math.round(Number(amount) * LAMPORTS_PER_SOL);
-    if (!Number.isFinite(lamports) || lamports <= 0) {
-      return res.status(400).json({ ok: false, error: "Invalid amount." });
-    }
-
-    // (Optional) You can validate depositSignature existence here if you want strict flow
-    if (depositSignature && typeof depositSignature === "string") {
-      // Just log, or fetch status if you want:
-      // const st = await connection.getSignatureStatuses([depositSignature], { searchTransactionHistory: true });
-      // console.log("Deposit status:", st.value?.[0]);
-    }
-
-    // Get recent blockhash
-    const { blockhash } = await connection.getLatestBlockhash("finalized");
-
-    // Build transfer from pool → recipient
-    const ix = SystemProgram.transfer({
-      fromPubkey: POOL_KEYPAIR.publicKey,
-      toPubkey: recipient,
-      lamports,
+async function handleRelay(req, res) {
+  // Ini placeholder aman. Agar benar-benar menarik dari pool,
+  // kamu harus menambahkan RELAYER_PRIVATE_KEY dan logika penarikan.
+  // Untuk saat ini kita balas 501 supaya UI bisa handle dengan jelas.
+  const { recipient, amountLamports } = req.body || {};
+  return res
+    .status(501)
+    .json({
+      ok: false,
+      error: 'relay_not_configured',
+      hint:
+        'Set RELAYER_PRIVATE_KEY dan implementasikan penarikan dari pool pada backend.'
     });
-
-    const tx = new Transaction({
-      feePayer: POOL_KEYPAIR.publicKey,
-      recentBlockhash: blockhash,
-    }).add(ix);
-
-    // Sign & send
-    tx.sign(POOL_KEYPAIR);
-    const raw = tx.serialize();
-    const sig = await connection.sendRawTransaction(raw, { skipPreflight: false });
-
-    // Confirm robustly
-    const status = await confirmBySignature(sig);
-    return res.json({
-      ok: true,
-      withdrawSignature: sig,
-      slot: status?.slot,
-      to: recipient.toBase58(),
-      amountLamports: lamports,
-    });
-  } catch (e) {
-    console.error("Withdraw error:", e);
-    return res.status(500).send(typeof e === "string" ? e : e.message || "Server error");
-  }
 }
 
-// Routes (both paths supported)
-app.post("/withdraw", handleWithdraw);
-app.post("/relay/withdraw", handleWithdraw);
-
-// Fallback
-app.use((req, res) => res.status(404).json({ ok: false, error: "Not found" }));
-
+// ---------- start ----------
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`ZKNON backend listening on :${PORT}`);
+  console.log(`ZKnon backend up on :${PORT}`);
+  console.log('POOL_ADDRESS:', POOL_ADDRESS);
+  console.log('CORS:', ALLOWED.join(', '));
 });
