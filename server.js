@@ -269,3 +269,4 @@ app.listen(PORT, () => {
   console.log(`[ZKnon] up on :${PORT}`);
   console.log(`Pool signer: ${POOL_PUBKEY.toBase58()}`);
 });
+
